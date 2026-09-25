@@ -13,8 +13,21 @@
   16 字节对齐的栈，且不消耗任何寄存器；
 * 空记录不消耗寄存器也不消耗栈。
 
+返回值约定（与参数编组配套）：
+
+* 标量及不超过 16 字节的聚合沿用同一块分类，经返回寄存器传递：整数类
+  返回寄存器 2 个、浮点类返回寄存器 2 个（至多 2 块，必然放得下）；
+* 空记录不占用任何返回寄存器；
+* 超过 16 字节的聚合由调用方传入有界返回缓冲区（ReturnBuffer），被调方
+  把隐藏指针（缓冲区地址）先占一个整数参数寄存器，再安排原参数——因此
+  它可能把后面的整个聚合挤到栈上；缓冲区的大小、对齐和范围在编码任何
+  参数之前先验证，失败不写入任何部分结果；
+* 所有 padding 写零；读取时 padding 不作为值解释。
+
 公开接口：类型构造（IntType/FloatType/PtrType/ArrayType/RecordType 及常量）、
-layout()、classify()、encode()、decode()、pack_call()、unpack_call()。
+layout()、classify()、encode()、decode()、pack_call()、unpack_call()、
+plan_return()、pack_return()、unpack_return()、simulate_call()、
+ReturnBuffer。
 
 错误语义：所有非法输入抛出 ABIError 子类，并尽量携带可定位的 path
 （如 ``arg[2].samples[3]``）。不做静默纠正：整数溢出、bool 冒充整数、
@@ -32,7 +45,9 @@ __all__ = [
     # 常量
     "INTEGER", "FLOAT", "MEMORY",
     "INT_REG_COUNT", "FLOAT_REG_COUNT", "STACK_ALIGN", "MAX_EIGHTBYTE_SIZE",
+    "RET_INT_REG_COUNT", "RET_FLOAT_REG_COUNT", "RET_BUFFER_ALIGN",
     "MAX_ARGS", "MAX_ARRAY_COUNT", "MAX_RECORD_FIELDS", "MAX_TYPE_SIZE",
+    "MAX_RET_BUFFER_SIZE",
     # 错误
     "ABIError", "InvalidTypeError", "RecursiveTypeError",
     "InvalidValueError", "IntegerOverflowError", "NonFiniteFloatError",
@@ -46,6 +61,9 @@ __all__ = [
     # 编组
     "Placement", "CallImage",
     "encode", "decode", "pack_call", "unpack_call",
+    # 返回值
+    "ReturnPlan", "ReturnBuffer", "ReturnImage",
+    "plan_return", "pack_return", "unpack_return", "simulate_call",
 ]
 
 # ---------------------------------------------------------------------------
@@ -61,10 +79,15 @@ FLOAT_REG_COUNT = 2
 STACK_ALIGN = 16
 MAX_EIGHTBYTE_SIZE = 16  # 聚合超过 16 字节整体走栈
 
+RET_INT_REG_COUNT = 2    # 整数类返回寄存器个数
+RET_FLOAT_REG_COUNT = 2  # 浮点类返回寄存器个数
+RET_BUFFER_ALIGN = 16    # 间接返回缓冲区地址对齐
+
 MAX_ARGS = 1024                 # 单次调用最多参数个数
 MAX_ARRAY_COUNT = 65536         # 数组最大元素数
 MAX_RECORD_FIELDS = 256         # 记录最大字段数
 MAX_TYPE_SIZE = 1 << 20         # 任一类型完整布局最大字节数（1 MiB）
+MAX_RET_BUFFER_SIZE = MAX_TYPE_SIZE  # 返回缓冲区容量上限（1 MiB）
 
 _INT_SIZES = (1, 2, 4, 8)
 
@@ -513,20 +536,30 @@ class CallImage:
     float_regs: 长度 2，未用槽位为 None，已用槽位为该 8 字节块解释的 double。
     stack: 16 字节对齐的栈映像字节串。
     placements: 与实参一一对应的安放结果。
+    ret_plan: 返回值安放方案（未指定返回类型时为 None）。
+    hidden_ptr: 间接返回时隐藏指针实参的安放结果（否则为 None）；它先于
+      所有用户参数占用一个整数参数寄存器，但不计入 placements。
     """
 
     int_regs: tuple
     float_regs: tuple
     stack: bytes
     placements: tuple[Placement, ...]
+    ret_plan: "ReturnPlan | None" = None
+    hidden_ptr: Placement | None = None
 
 
-def pack_call(args) -> CallImage:
+def pack_call(args, ret_type=None, ret_buffer=None) -> CallImage:
     """把 ``[(Type, value), ...]`` 编组为寄存器 + 栈映像。
 
     逐参数：size 为 0 的聚合不占资源；超过 16 字节走栈；否则按块申请
     寄存器，寄存器不足时整体走 16 字节对齐的栈且不消耗寄存器。
     任一参数非法时整体抛错，不返回部分结果。
+
+    指定 ``ret_type`` 时同时规划返回值：超过 16 字节的返回聚合要求
+    ``ret_buffer``（ReturnBuffer），其大小、对齐、范围在编码任何参数
+    之前先验证；隐藏指针（缓冲区地址）先占整数参数寄存器 0，再安排
+    原参数。返回类型不需要缓冲区时传入 ``ret_buffer`` 同样报错。
     """
     if not isinstance(args, (list, tuple)):
         raise InvalidValueError(
@@ -541,6 +574,25 @@ def pack_call(args) -> CallImage:
     placements: list[Placement] = []
     next_int = 0
     next_float = 0
+
+    # 返回值规划与缓冲区验证：先于任何参数编码，失败不留部分结果。
+    ret_plan: ReturnPlan | None = None
+    hidden_ptr: Placement | None = None
+    if ret_type is not None:
+        _check_type(ret_type)
+        ret_plan = plan_return(ret_type)
+        if ret_plan.kind == "indirect":
+            buf = _validate_return_buffer(ret_plan, ret_buffer)
+            int_regs[0] = buf.address
+            next_int = 1
+            hidden_ptr = Placement("registers", (INTEGER,), (0,), (), None, 8)
+        elif ret_buffer is not None:
+            raise InvalidValueError(
+                f"return type {ret_type.name} is returned in registers; "
+                "a return buffer must not be supplied", "ret_buffer")
+    elif ret_buffer is not None:
+        raise InvalidValueError(
+            "ret_buffer supplied without ret_type", "ret_buffer")
 
     def to_stack(data: bytes, cls: tuple[str, ...], size: int) -> Placement:
         off = _align_up(len(stack), STACK_ALIGN)
@@ -594,7 +646,7 @@ def pack_call(args) -> CallImage:
 
     stack.extend(b"\x00" * (-len(stack) % STACK_ALIGN))
     return CallImage(tuple(int_regs), tuple(float_regs), bytes(stack),
-                     tuple(placements))
+                     tuple(placements), ret_plan, hidden_ptr)
 
 
 def unpack_call(types, image: CallImage) -> list:
@@ -637,3 +689,194 @@ def unpack_call(types, image: CallImage) -> list:
             raise InvalidValueError(f"unknown placement kind {pl.kind!r}", path)
         values.append(decode(t, data, lay, path))
     return values
+
+
+# ---------------------------------------------------------------------------
+# 返回值编组：返回寄存器 / 有界返回缓冲区
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReturnPlan:
+    """一个返回类型的安放方案。
+
+    kind: ``"registers"``（标量或 ≤16 字节聚合，走返回寄存器）/
+    ``"indirect"``（>16 字节聚合，经调用方提供的缓冲区间接返回）/
+    ``"none"``（空记录，不占任何返回寄存器）。
+    """
+
+    kind: str
+    eightbytes: tuple[str, ...]
+    size: int
+    align: int
+
+
+@dataclass(frozen=True)
+class ReturnBuffer:
+    """调用方为间接返回提供的有界缓冲区。
+
+    address: 缓冲区起始地址（须按 RET_BUFFER_ALIGN 对齐的 64 位无符号值）；
+    size: 缓冲区容量字节数（须 ≥ 返回类型 size，且 ≤ MAX_RET_BUFFER_SIZE）。
+    """
+
+    address: int
+    size: int
+
+
+@dataclass(frozen=True)
+class ReturnImage:
+    """一次返回的完整编组映像。
+
+    int_regs / float_regs: 返回寄存器映像（未用槽位为 None）。
+    memory: 间接返回时被调方写入缓冲区地址处的字节串（其余情形为 b""）。
+    """
+
+    plan: ReturnPlan
+    int_regs: tuple
+    float_regs: tuple
+    memory: bytes
+
+
+def plan_return(ret_type: Type) -> ReturnPlan:
+    """规划返回类型的安放方案（与参数同一套块分类）。"""
+    _check_type(ret_type)
+    lay = layout(ret_type)
+    cls = classify(ret_type)
+    if not cls:
+        return ReturnPlan("none", (), 0, 1)
+    if cls == (MEMORY,):
+        return ReturnPlan("indirect", cls, lay.size, lay.align)
+    return ReturnPlan("registers", cls, lay.size, lay.align)
+
+
+def _validate_return_buffer(plan: ReturnPlan, buf) -> ReturnBuffer:
+    """验证间接返回缓冲区的大小、对齐与范围。失败抛错，调用方不得写部分结果。"""
+    path = "ret_buffer"
+    if not isinstance(buf, ReturnBuffer):
+        raise InvalidValueError(
+            f"return type needs an indirect buffer: expected a ReturnBuffer, "
+            f"got {buf!r}", path)
+    if isinstance(buf.address, bool) or not isinstance(buf.address, int):
+        raise InvalidValueError(
+            f"buffer address must be an int (bool is not accepted), "
+            f"got {buf.address!r}", path)
+    if not 0 <= buf.address <= (1 << 64) - 1:
+        raise InvalidValueError(
+            f"buffer address {buf.address} out of range [0, 2**64 - 1]", path)
+    if buf.address % RET_BUFFER_ALIGN != 0:
+        raise InvalidValueError(
+            f"buffer address {buf.address:#x} is not aligned to "
+            f"{RET_BUFFER_ALIGN}", path)
+    if isinstance(buf.size, bool) or not isinstance(buf.size, int):
+        raise InvalidValueError(
+            f"buffer size must be an int (bool is not accepted), "
+            f"got {buf.size!r}", path)
+    if not 0 < buf.size <= MAX_RET_BUFFER_SIZE:
+        raise InvalidValueError(
+            f"buffer size {buf.size} out of range (0, {MAX_RET_BUFFER_SIZE}]",
+            path)
+    if buf.size < plan.size:
+        raise InvalidValueError(
+            f"buffer size {buf.size} < return type size {plan.size}", path)
+    if buf.address + plan.size > 1 << 64:
+        raise InvalidValueError(
+            f"buffer range [{buf.address:#x}, {buf.address + plan.size:#x}) "
+            "overflows the 64-bit address space", path)
+    return buf
+
+
+def pack_return(ret_type: Type, value, plan: ReturnPlan | None = None
+                ) -> ReturnImage:
+    """把返回值编组为返回寄存器映像或待写入缓冲区的字节串。
+
+    值先经 ``encode`` 完整校验与编码，非法值抛错且不产生任何部分结果；
+    padding 一律写零。
+    """
+    _check_type(ret_type)
+    if plan is None:
+        plan = plan_return(ret_type)
+    elif plan != plan_return(ret_type):
+        raise InvalidValueError(
+            f"plan {plan!r} does not match return type {ret_type.name}")
+    data = encode(ret_type, value, path="return")
+
+    if plan.kind == "none":
+        return ReturnImage(plan, (None,) * RET_INT_REG_COUNT,
+                           (None,) * RET_FLOAT_REG_COUNT, b"")
+    if plan.kind == "indirect":
+        return ReturnImage(plan, (None,) * RET_INT_REG_COUNT,
+                           (None,) * RET_FLOAT_REG_COUNT, data)
+
+    int_regs: list = [None] * RET_INT_REG_COUNT
+    float_regs: list = [None] * RET_FLOAT_REG_COUNT
+    ni = nf = 0
+    for k, c in enumerate(plan.eightbytes):
+        chunk = data[8 * k:8 * k + 8].ljust(8, b"\x00")
+        if c == INTEGER:
+            int_regs[ni] = int.from_bytes(chunk, "little")
+            ni += 1
+        else:
+            float_regs[nf] = struct.unpack("<d", chunk)[0]
+            nf += 1
+    return ReturnImage(plan, tuple(int_regs), tuple(float_regs), b"")
+
+
+def unpack_return(ret_type: Type, image: ReturnImage,
+                  plan: ReturnPlan | None = None):
+    """调用方按返回类型从 ``image`` 读取返回值（``pack_return`` 的逆）。
+
+    只按字段布局读取有效字节，padding 不作为值解释。
+    """
+    _check_type(ret_type)
+    if not isinstance(image, ReturnImage):
+        raise InvalidValueError(f"expected a ReturnImage, got {image!r}")
+    if plan is None:
+        plan = plan_return(ret_type)
+    if image.plan != plan:
+        raise InvalidValueError(
+            f"image plan {image.plan!r} does not match return type "
+            f"{ret_type.name} plan {plan!r}")
+    lay = layout(ret_type)
+
+    if plan.kind == "none":
+        return decode(ret_type, b"", lay, "return")
+    if plan.kind == "indirect":
+        if len(image.memory) != plan.size:
+            raise InvalidValueError(
+                f"return buffer content is {len(image.memory)} bytes, "
+                f"expected {plan.size}", "return")
+        return decode(ret_type, image.memory, lay, "return")
+
+    chunks: list[bytes] = []
+    ni = nf = 0
+    for c in plan.eightbytes:
+        if c == INTEGER:
+            v = image.int_regs[ni] if ni < len(image.int_regs) else None
+            ni += 1
+            if v is None:
+                raise InvalidValueError(
+                    "return integer register slot is empty", "return")
+            chunks.append(v.to_bytes(8, "little"))
+        else:
+            v = image.float_regs[nf] if nf < len(image.float_regs) else None
+            nf += 1
+            if v is None:
+                raise InvalidValueError(
+                    "return float register slot is empty", "return")
+            chunks.append(struct.pack("<d", v))
+    return decode(ret_type, b"".join(chunks)[:lay.size], lay, "return")
+
+
+def simulate_call(func, args, ret_type: Type, ret_buffer=None):
+    """完整调用流程：参数编组 → 被调方解参与计算 → 返回编组 → 调用方读取。
+
+    ``func`` 接收解组后的实参并返回结果；返回值按 ``ret_type`` 编组，
+    间接返回时写入 ``ret_buffer`` 指向的缓冲区（以 ReturnImage.memory
+    表示写入的字节）。任一步失败整体抛错，不留下部分结果。
+    """
+    if not callable(func):
+        raise InvalidValueError(f"func must be callable, got {func!r}")
+    image = pack_call(args, ret_type=ret_type, ret_buffer=ret_buffer)
+    values = unpack_call([t for t, _ in args], image)
+    result = func(*values)
+    ret_image = pack_return(ret_type, result, image.ret_plan)
+    return unpack_return(ret_type, ret_image, image.ret_plan)
