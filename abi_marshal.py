@@ -12,6 +12,9 @@
 * 整数寄存器 4 个、浮点寄存器 2 个；一个聚合所需寄存器不足时，整体走
   16 字节对齐的栈，且不消耗任何寄存器；
 * 空记录不消耗寄存器也不消耗栈。
+* 记录可含无符号位域字段：底层存储单元仅 8/16/32 位无符号整数，小端、
+  低位先分配；字段不横跨单元，放不下即开新单元；零宽字段结束当前单元，
+  下一字段重新对齐。未用位与结构体填充一律清零。
 
 公开接口：类型构造（IntType/FloatType/PtrType/ArrayType/RecordType 及常量）、
 layout()、classify()、encode()、decode()、pack_call()、unpack_call()。
@@ -38,6 +41,7 @@ __all__ = [
     "InvalidValueError", "IntegerOverflowError", "NonFiniteFloatError",
     # 类型
     "Type", "IntType", "FloatType", "PtrType", "ArrayType", "RecordType",
+    "BitfieldType",
     "INT8", "INT16", "INT32", "INT64",
     "UINT8", "UINT16", "UINT32", "UINT64",
     "DOUBLE", "PTR",
@@ -67,6 +71,7 @@ MAX_RECORD_FIELDS = 256         # 记录最大字段数
 MAX_TYPE_SIZE = 1 << 20         # 任一类型完整布局最大字节数（1 MiB）
 
 _INT_SIZES = (1, 2, 4, 8)
+_BITFIELD_UNIT_SIZES = (1, 2, 4)  # 位域存储单元仅 8/16/32 位
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +189,44 @@ class ArrayType(Type):
         return f"{self.elem.name}[{self.count}]"
 
 
+@dataclass(frozen=True)
+class BitfieldType(Type):
+    """无符号位域字段：底层存储单元为 8/16/32 位无符号整数。
+
+    ``width`` 为占用位数；``width == 0`` 表示零宽字段（结束当前存储单元，
+    下一字段重新对齐），不持有值，也不出现在记录值字典中。
+    """
+
+    base: IntType
+    width: int
+
+    def __post_init__(self):
+        if not isinstance(self.base, IntType):
+            raise InvalidTypeError(
+                f"bitfield base must be an IntType, got {self.base!r}")
+        if self.base.signed:
+            raise InvalidTypeError("bitfield base must be unsigned")
+        if self.base.size not in _BITFIELD_UNIT_SIZES:
+            raise InvalidTypeError(
+                f"bitfield unit size must be one of {_BITFIELD_UNIT_SIZES} "
+                f"bytes, got {self.base.size}")
+        if isinstance(self.width, bool) or not isinstance(self.width, int):
+            raise InvalidTypeError(
+                f"bitfield width must be an int, got {self.width!r}")
+        if not 0 <= self.width <= self.base.size * 8:
+            raise InvalidTypeError(
+                f"bitfield width {self.width} out of range "
+                f"[0, {self.base.size * 8}]")
+
+    @property
+    def name(self) -> str:
+        return f"u{self.base.size * 8}:{self.width}"
+
+    @property
+    def range(self) -> tuple[int, int]:
+        return (0, (1 << self.width) - 1)
+
+
 class RecordType(Type):
     """命名字段记录。支持先建壳后 ``define()``，以便表达（并被拒绝的）循环。"""
 
@@ -266,6 +309,9 @@ class FieldLayout:
     offset: int
     type: Type
     layout: "Layout"
+    # 位域字段专用：单元内位偏移与（已就位的）掩码；非位域为 None
+    bit_offset: int | None = None
+    mask: int | None = None
 
 
 @dataclass(frozen=True)
@@ -300,6 +346,9 @@ def layout(t: Type, _visiting: frozenset[int] | None = None) -> Layout:
         align = elem_layout.align if t.count > 0 else 1
         return Layout(t, size, align)
 
+    if isinstance(t, BitfieldType):
+        return Layout(t, t.base.size, t.base.size)
+
     if isinstance(t, RecordType):
         if id(t) in _visiting:
             raise RecursiveTypeError(
@@ -309,7 +358,37 @@ def layout(t: Type, _visiting: frozenset[int] | None = None) -> Layout:
         offset = 0
         align = 1
         field_layouts: list[FieldLayout] = []
+        unit_open = False
+        open_unit_bits = 0
+        unit_start = 0
+        unit_used = 0
         for fname, ftype in fields:
+            if isinstance(ftype, BitfieldType):
+                flay = layout(ftype, visiting)
+                unit_bits = ftype.base.size * 8
+                if ftype.width == 0:
+                    # 零宽字段：结束当前单元，下一字段重新对齐
+                    unit_open = False
+                    field_layouts.append(
+                        FieldLayout(fname, offset, ftype, flay))
+                    continue
+                if (not unit_open or open_unit_bits != unit_bits
+                        or unit_used + ftype.width > unit_bits):
+                    # 当前单元放不下（或无单元）：对齐后开新单元
+                    offset = _align_up(offset, ftype.base.size)
+                    unit_open = True
+                    open_unit_bits = unit_bits
+                    unit_start = offset
+                    unit_used = 0
+                    offset += ftype.base.size
+                align = max(align, flay.align)
+                mask = ((1 << ftype.width) - 1) << unit_used
+                field_layouts.append(
+                    FieldLayout(fname, unit_start, ftype, flay,
+                                unit_used, mask))
+                unit_used += ftype.width
+                continue
+            unit_open = False
             flay = layout(ftype, visiting)
             align = max(align, flay.align)
             offset = _align_up(offset, flay.align)
@@ -332,6 +411,9 @@ def _spans(t: Type, lay: Layout, base: int, out: list[tuple[int, int, str]]) -> 
     """把类型的所有标量叶子展开为 (偏移, 长度, 类) 区间。"""
     if isinstance(t, (IntType, PtrType)):
         out.append((base, lay.size, INTEGER))
+    elif isinstance(t, BitfieldType):
+        if t.width > 0:
+            out.append((base, lay.size, INTEGER))
     elif isinstance(t, FloatType):
         out.append((base, lay.size, FLOAT))
     elif isinstance(t, ArrayType):
@@ -432,7 +514,9 @@ def encode(t: Type, value, lay: Layout | None = None, path: str = "value") -> by
         if not isinstance(value, Mapping):
             raise InvalidValueError(
                 f"expected a mapping of record fields, got {value!r}", path)
-        expected = {f.name for f in lay.fields}
+        expected = {f.name for f in lay.fields
+                    if not (isinstance(f.type, BitfieldType)
+                            and f.type.width == 0)}
         actual = set(value.keys())
         missing = expected - actual
         extra = actual - expected
@@ -444,6 +528,27 @@ def encode(t: Type, value, lay: Layout | None = None, path: str = "value") -> by
                 f"record {t.name!r} has unexpected fields {sorted(extra)}", path)
         buf = bytearray(lay.size)
         for f in lay.fields:
+            if isinstance(f.type, BitfieldType):
+                if f.type.width == 0:
+                    continue
+                v = value[f.name]
+                if isinstance(v, bool) or not isinstance(v, int):
+                    raise InvalidValueError(
+                        f"expected an int (bool is not accepted), got {v!r}",
+                        f"{path}.{f.name}")
+                lo, hi = f.type.range
+                if not lo <= v <= hi:
+                    raise IntegerOverflowError(
+                        f"value {v} out of range [{lo}, {hi}] for "
+                        f"bitfield {f.type.name}", f"{path}.{f.name}")
+                # 只写本字段掩码内的位，未用位与相邻字段不受影响
+                unit_size = f.layout.size
+                unit = int.from_bytes(
+                    buf[f.offset:f.offset + unit_size], 'little')
+                unit |= (v << f.bit_offset) & f.mask
+                buf[f.offset:f.offset + unit_size] = (
+                    unit.to_bytes(unit_size, 'little'))
+                continue
             chunk = encode(f.type, value[f.name], f.layout, f"{path}.{f.name}")
             buf[f.offset:f.offset + f.layout.size] = chunk
         return bytes(buf)
@@ -479,11 +584,21 @@ def decode(t: Type, data: bytes, lay: Layout | None = None, path: str = "value")
         ]
     if isinstance(t, RecordType):
         return {
-            f.name: decode(f.type, data[f.offset:f.offset + f.layout.size],
-                           f.layout, f"{path}.{f.name}")
+            f.name: _decode_field(f, data, path)
             for f in lay.fields
+            if not (isinstance(f.type, BitfieldType) and f.type.width == 0)
         }
     raise InvalidTypeError(f"unsupported type {t!r}")  # pragma: no cover
+
+
+def _decode_field(f: FieldLayout, data: bytes, path: str):
+    """解码记录的一个字段；位域按位偏移/掩码从存储单元中取出。"""
+    if isinstance(f.type, BitfieldType):
+        unit = int.from_bytes(
+            data[f.offset:f.offset + f.layout.size], 'little')
+        return (unit & f.mask) >> f.bit_offset
+    return decode(f.type, data[f.offset:f.offset + f.layout.size],
+                  f.layout, f"{path}.{f.name}")
 
 
 # ---------------------------------------------------------------------------

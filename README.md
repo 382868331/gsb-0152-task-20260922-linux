@@ -12,9 +12,22 @@
 ## 命令
 
 ```sh
-python -m unittest discover -s tests -v   # 运行测试（42 个用例）
+python -m unittest discover -s tests -v   # 运行测试（65 个用例）
 python demo.py                            # 固定输入演示（约 1 秒内完成）
+python demo_iteration.py                  # 位域迭代演示（正常 + 边界，约 0.1 秒）
 ```
+
+## venv 准备
+
+仓库自带 `.venv`（Python 3.14.7）。如需重建：
+
+```sh
+python3.14 -m venv .venv        # 或：python3 -m venv .venv
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+无第三方依赖，`requirements.txt` 为空占位；venv 激活与否均可，
+只要解释器是 Python 3.14.7。
 
 ## 明示 ABI 契约（本模块实现且仅实现此子集）
 
@@ -27,9 +40,14 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 - 整数寄存器 4 个、浮点寄存器 2 个；聚合所需寄存器不足时**整体**走
   16 字节对齐的栈，且**不消耗任何寄存器**（不允许拆半安放）；
 - 空记录不消耗寄存器也不消耗栈。
+- 记录可含**无符号位域**字段：底层存储单元仅 8/16/32 位无符号整数；
+  小端、低位（LSB）先分配；字段不横跨单元，当前单元放不下即开新单元
+  （按单元大小对齐）；零宽字段结束当前单元，下一字段重新对齐；未用位
+  与结构体填充一律清零；位域字节按整数类参与 8 字节块分类。
 
 本模块是题面定义的合成 ABI，**不宣称**与 System V AMD64 或任何真实
-平台 ABI 完整兼容（例如不实现 SSEUP、X87、按位域合并等规则）。
+平台 ABI 完整兼容（例如不实现 SSEUP、X87 等规则；位域打包规则是
+题内自定义规则，不对应任何真实编译器的位域 ABI）。
 
 ## 公开接口
 
@@ -42,12 +60,13 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 | `PtrType()` / `PTR` | 8 字节指针 |
 | `ArrayType(elem, count)` | 显式长度同类数组 |
 | `RecordType(name)` + `.define([(字段名, 类型), ...])` | 记录；支持先建壳后定义 |
+| `BitfieldType(base, width)` | 无符号位域；`base` 为 `UINT8/16/32`，`width ∈ [0, base 位数]`；`width=0` 为零宽分隔字段 |
 
 函数：
 
 | 函数 | 语义 |
 |---|---|
-| `layout(t) -> Layout` | `size/align` 及逐字段 `FieldLayout(name, offset, type, layout)` |
+| `layout(t) -> Layout` | `size/align` 及逐字段 `FieldLayout(name, offset, type, layout, bit_offset, mask)`；位域字段给出字节位置、单元内位偏移与已就位掩码，非位域字段后两者为 `None` |
 | `classify(t) -> tuple[str, ...]` | 逐 8 字节块 `INTEGER`/`FLOAT`；`()`（空）或 `(MEMORY,)` |
 | `encode(t, value) -> bytes` / `decode(t, data) -> value` | 类型化小端字节编解码 |
 | `pack_call([(Type, value), ...]) -> CallImage` | 编组为寄存器 + 栈映像 |
@@ -59,7 +78,10 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 stack_offset, size)`，`kind ∈ {"registers", "stack", "none"}`）。
 
 值的 Python 表示：整数/指针 → `int`；浮点 → `float`；数组 → `list`；
-记录 → `dict`（字段名 → 值，键集合必须与定义完全一致）。
+记录 → `dict`（字段名 → 值，键集合必须与定义完全一致；零宽位域
+不持有值，不出现在字典中）。位域值为 `int`，范围 `[0, 2**width - 1]`，
+超范围抛 `IntegerOverflowError`（`pack_call` 整次拒绝，不留部分结果）；
+相邻位域写入互不影响（按掩码合并，未用位保持为零）。
 
 ## 错误语义
 
@@ -107,7 +129,8 @@ demo 不穷举上限规模。
 
 ## 已知限制
 
-- 仅实现题面子集：无位域、无联合、无可变长度数组、无返回值编组；
+- 仅实现题面子集：无联合、无可变长度数组、无返回值编组；位域仅支持
+  记录内的无符号 8/16/32 位单元，不支持 64 位单元、不支持位域数组；
 - 标量参数在寄存器耗尽时同样走栈（题面只规定聚合的回退，此处对标量
   采用同一规则）；
 - `unpack_call` 信任 `CallImage` 内部一致性，仅校验栈长度等结构性错误；
@@ -120,5 +143,13 @@ demo 不穷举上限规模。
   覆盖混合类聚合、整体回退、尾填充、嵌套数组、空记录约定、循环类型、
   整数溢出、bool/NaN 拒绝、错误路径定位；pack/unpack 往返一致仅作
   补充测试；
+- `tests/test_bitfields.py`：位域布局与编解码的期望字节由测试文件内
+  **独立编写**的逐位组装/取出参考 `set_bits`/`get_bits` 生成（不调用
+  被测核心）；覆盖跨单元分配、零宽分隔、嵌套记录、恰好 16 字节进
+  寄存器与 20 字节走栈的分界、未用位/填充清零、相邻字段不互相覆盖、
+  位域溢出整次拒绝，以及不含位域的旧类型布局保持不变；
+- `demo_iteration.py`：现场真实计算位域记录的布局、编码字节、
+  pack/unpack 重建、16/20 字节寄存器-栈分界，以及一次实际触发的
+  位域越界拒绝（约 0.1 秒完成，无 sleep、无预录输出）；
 - `demo.py`：真实计算并打印布局、寄存器、栈映像、参数重建，以及一次
   实际触发的越界拒绝（`u8 = 300`）与 NaN 拒绝。
