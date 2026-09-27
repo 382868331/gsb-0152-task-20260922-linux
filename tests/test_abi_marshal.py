@@ -456,5 +456,119 @@ class TestEncodeBytes(unittest.TestCase):
         self.assertEqual(data, bytes([0xAA, 0, 0, 0, 4, 3, 2, 1]))
 
 
+class TestPackReturnRegisters(unittest.TestCase):
+    def test_scalar_and_small_array_returns(self):
+        img = am.pack_return(am.INT32, -7)
+        self.assertEqual(img.kind, "registers")
+        self.assertEqual(img.eightbytes, (am.INTEGER,))
+        self.assertEqual(img.int_regs[0], (-7) & 0xFFFFFFFF)
+        self.assertEqual(am.unpack_return(am.INT32, img), -7)
+
+        arr = am.ArrayType(am.UINT8, 7)
+        img2 = am.pack_return(arr, [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual((img2.kind, img2.size), ("registers", 7))
+        self.assertEqual(img2.int_regs[0], 0x07060504030201)
+        self.assertEqual(am.unpack_return(arr, img2), [1, 2, 3, 4, 5, 6, 7])
+
+    def test_mixed_nested_return_uses_both_register_classes(self):
+        inner = rec("RetInner", [("x", am.UINT8), ("y", am.UINT8)])
+        mixed = rec("RetMixed", [("d", am.DOUBLE), ("tag", inner)])
+        lay = am.layout(mixed)
+        self.assertEqual(lay.size, 16)
+        value = {"d": -2.5, "tag": {"x": 0xAA, "y": 0xBB}}
+        img = am.pack_return(mixed, value)
+        self.assertEqual(img.kind, "registers")
+        self.assertEqual(img.eightbytes, (am.FLOAT, am.INTEGER))
+        self.assertEqual(img.float_regs[0], -2.5)
+        self.assertEqual(img.int_regs[0], 0xBBAA)
+        self.assertEqual(am.unpack_return(mixed, img), value)
+
+    def test_empty_record_return_consumes_nothing(self):
+        empty = rec("RetEmpty", [])
+        img = am.pack_return(empty, {})
+        self.assertEqual(img.kind, "none")
+        self.assertEqual(img.eightbytes, ())
+        self.assertEqual(img.int_regs, (None,) * am.INT_REG_COUNT)
+        self.assertEqual(img.float_regs, (None,) * am.FLOAT_REG_COUNT)
+        self.assertEqual(am.unpack_return(empty, img), {})
+
+
+class TestMemoryReturn(unittest.TestCase):
+    def test_nested_record_and_array_rebuilt_from_buffer(self):
+        inner = rec("BigInner", [("a", am.UINT8), ("b", am.UINT32)])
+        big = rec("BigReturn", [("items", am.ArrayType(inner, 3)),
+                                 ("count", am.UINT32)])
+        lay = am.layout(big)
+        self.assertEqual((lay.size, lay.align), (28, 4))
+        self.assertEqual(am.classify(big), (am.MEMORY,))
+
+        value = {
+            "items": [{"a": 1, "b": 0x04030201},
+                      {"a": 2, "b": 0x08070605},
+                      {"a": 3, "b": 0x0C0B0A09}],
+            "count": 3,
+        }
+        buf = am.ResultBuffer(big, 0x1000)
+        img = am.pack_return(big, value, buf)
+        self.assertEqual(img.kind, "memory")
+        self.assertEqual(img.eightbytes, (am.MEMORY,))
+        self.assertEqual(img.result_address, 0x1000)
+        self.assertEqual(img.int_regs[0], 0x1000)
+        self.assertEqual(img.float_regs, (None, None))
+        self.assertEqual(img.size, 28)
+        expected = bytes([
+            1, 0, 0, 0, 1, 2, 3, 4,
+            2, 0, 0, 0, 5, 6, 7, 8,
+            3, 0, 0, 0, 9, 10, 11, 12,
+            3, 0, 0, 0,
+        ])
+        self.assertEqual(buf.contents, expected)
+        self.assertEqual(am.unpack_return(big, img, buf), value)
+
+    def test_sret_address_is_first_argument_and_shifts_later_args(self):
+        big = am.ArrayType(am.UINT8, 20)
+        buf = am.ResultBuffer(big, 0x2000)
+        args = [(am.INT64, 10), (am.INT64, 20), (am.INT64, 30),
+                (am.INT64, 40), (am.DOUBLE, 1.25)]
+        img = am.pack_call(args, return_type=big, result_buffer=buf)
+
+        self.assertEqual(img.sret_pointer.kind, "registers")
+        self.assertEqual(img.sret_pointer.int_regs, (0,))
+        self.assertEqual(img.result_address, 0x2000)
+        self.assertEqual([p.kind for p in img.placements],
+                         ["registers", "registers", "registers", "stack",
+                          "registers"])
+        self.assertEqual(img.int_regs, (0x2000, 10, 20, 30))
+        self.assertEqual(img.stack[:8], (40).to_bytes(8, "little"))
+        self.assertEqual(img.float_regs[0], 1.25)
+        self.assertEqual(am.unpack_call([t for t, _ in args], img),
+                         [10, 20, 30, 40, 1.25])
+
+    def test_result_buffer_validation(self):
+        big = am.ArrayType(am.UINT8, 20)
+        small = am.ArrayType(am.UINT8, 8)
+        with self.assertRaises(am.InvalidTypeError):
+            am.ResultBuffer(small)
+        with self.assertRaises(am.InvalidValueError):
+            am.ResultBuffer(big, 0x1004)
+        with self.assertRaises(am.IntegerOverflowError):
+            am.ResultBuffer(big, 2**64)
+        with self.assertRaises(am.InvalidValueError):
+            am.pack_call([], return_type=big)
+        buf = am.ResultBuffer(big)
+        with self.assertRaises(am.InvalidValueError):
+            am.pack_call([], return_type=small, result_buffer=buf)
+        with self.assertRaises(am.InvalidValueError):
+            am.pack_return(small, [0] * 8, buf)
+
+    def test_unpack_rejects_address_mismatch(self):
+        big = am.ArrayType(am.UINT8, 20)
+        buf = am.ResultBuffer(big, 0x3000)
+        img = am.pack_return(big, list(range(20)), buf)
+        other = am.ResultBuffer(big, 0x4000)
+        with self.assertRaises(am.InvalidValueError):
+            am.unpack_return(big, img, other)
+
+
 if __name__ == "__main__":
     unittest.main()

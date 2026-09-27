@@ -12,7 +12,7 @@
 ## 命令
 
 ```sh
-python -m unittest discover -s tests -v   # 运行测试（42 个用例）
+python -m unittest discover -s tests -v   # 运行测试（49 个用例）
 python demo.py                            # 固定输入演示（约 1 秒内完成）
 ```
 
@@ -52,6 +52,21 @@ python demo.py                            # 固定输入演示（约 1 秒内完
 | `encode(t, value) -> bytes` / `decode(t, data) -> value` | 类型化小端字节编解码 |
 | `pack_call([(Type, value), ...]) -> CallImage` | 编组为寄存器 + 栈映像 |
 | `unpack_call(types, image) -> list` | 从映像重建参数值 |
+
+`pack_call` 另接受可选的 `return_type=` 与 `result_buffer=`；返回类型超过
+16 字节时，调用方提供结果空间，其地址作为隐藏的第一个 `ptr` 参数。
+
+返回值接口：
+
+| 名称 | 说明 |
+|---|---|
+| `ResultBuffer(t, address=DEFAULT_RESULT_ADDRESS)` | 调用方为大结果提供的合成空间；地址必须 16 字节对齐，容量等于完整布局大小（含嵌套记录/数组间隙和尾填充） |
+| `pack_return(t, value, result_buffer=None) -> ReturnImage` | 小结果按 8 字节块进寄存器；大结果写入结果空间并在整数寄存器 0 回传地址；空记录不占资源 |
+| `unpack_return(t, image, result_buffer=None)` | 按同一布局、对齐与填充规则重建返回值 |
+
+`ReturnImage.kind` 为 `registers` / `memory` / `none`；`int_regs` 与
+`float_regs` 长度同样固定为 4 和 2。大结果场景的 `CallImage.sret_pointer`
+是隐藏地址自身的安放记录，`CallImage.placements` 仍只列显式参数。
 
 `CallImage`：`int_regs`（4 槽，未用为 `None`，已用为该 8 字节块的小端
 整数值）、`float_regs`（2 槽，double）、`stack`（16 字节对齐字节串）、
@@ -104,10 +119,16 @@ demo 不穷举上限规模。
 - **记录先建壳后 `define`**：使循环类型可表达，从而在 `layout` 时
   被 `RecursiveTypeError` 显式拒绝（直接、间接、经数组的循环均检测）；
 - **无全局状态**：每次 `pack_call` 独立计算，失败不留部分结果。
+- **大结果空间是合成字节缓冲**：`ResultBuffer` 只模拟“调用方提供地址、被
+  调方写入完整布局”的协议，不读写真实地址；
+- **返回值与参数共用同一套分类和重建规则**：嵌套记录、数组、自然对齐、
+  间隙和尾填充都由 `encode/decode` 统一处理；
+- **隐藏地址先占参数位置**：大返回值的 `ptr` 地址先于显式参数申请整数
+  寄存器/栈，因此显式参数按原始 `pack_call` 规则整体顺延。
 
 ## 已知限制
 
-- 仅实现题面子集：无位域、无联合、无可变长度数组、无返回值编组；
+- 仅实现题面子集：无位域、无联合、无可变长度数组；
 - 标量参数在寄存器耗尽时同样走栈（题面只规定聚合的回退，此处对标量
   采用同一规则）；
 - `unpack_call` 信任 `CallImage` 内部一致性，仅校验栈长度等结构性错误；
@@ -120,5 +141,6 @@ demo 不穷举上限规模。
   覆盖混合类聚合、整体回退、尾填充、嵌套数组、空记录约定、循环类型、
   整数溢出、bool/NaN 拒绝、错误路径定位；pack/unpack 往返一致仅作
   补充测试；
-- `demo.py`：真实计算并打印布局、寄存器、栈映像、参数重建，以及一次
-  实际触发的越界拒绝（`u8 = 300`）与 NaN 拒绝。
+- `demo.py`：真实计算并打印布局、寄存器、栈映像、参数重建、小返回值/大
+  返回值编组（含嵌套记录数组的对齐填充），以及一次实际触发的越界拒绝
+  （`u8 = 300`）与 NaN 拒绝。

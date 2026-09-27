@@ -4,7 +4,8 @@
 1. 构造一组聚合类型并打印逐字段字节布局与 8 字节块分类；
 2. pack_call 编组一次混合调用，打印寄存器与栈映像；
 3. unpack_call 从映像重建参数并校验一致；
-4. 实际触发一次越界拒绝（u8 赋值 300）。
+4. 演示小返回值进寄存器、大返回值写入调用方空间且隐藏地址顺延参数；
+5. 实际触发一次越界拒绝（u8 赋值 300）。
 """
 
 import abi_marshal as am
@@ -68,7 +69,43 @@ def main():
     print(f"  rebuilt[3]['pos']     = {rebuilt[3]['pos']}")
     assert ok, "round-trip mismatch"
 
-    print("\n== 4. 越界拒绝演示 ==")
+    print("\n== 4. pack_return / unpack_return：返回值编组 ==")
+    small_ret = am.RecordType("SmallReturn")
+    small_ret.define([("weight", am.DOUBLE), ("id", am.INT32)])
+    small_value = {"weight": 1.75, "id": 99}
+    small_image = am.pack_return(small_ret, small_value)
+    print(f"  small {small_ret.name}: kind={small_image.kind} "
+          f"eightbytes={small_image.eightbytes} "
+          f"int_regs={small_image.int_regs} float_regs={small_image.float_regs}")
+    print(f"  rebuilt small return = {am.unpack_return(small_ret, small_image)}")
+
+    item_t = am.RecordType("ResultItem")
+    item_t.define([("a", am.UINT8), ("b", am.UINT32)])
+    big_ret = am.RecordType("BigResult")
+    big_ret.define([("items", am.ArrayType(item_t, 3)),
+                    ("count", am.UINT32)])
+    big_value = {
+        "items": [{"a": 1, "b": 100}, {"a": 2, "b": 200},
+                  {"a": 3, "b": 300}],
+        "count": 3,
+    }
+    result_buf = am.ResultBuffer(big_ret, 0x7F0000002000)
+    call_image = am.pack_call([(am.INT64, 11), (am.DOUBLE, 0.5)],
+                              return_type=big_ret, result_buffer=result_buf)
+    print("  caller-side hidden result pointer: "
+          f"placement={call_image.sret_pointer} address="
+          f"0x{call_image.result_address:x}")
+    print("  visible args after hidden pointer: "
+          f"{[(p.kind, p.int_regs, p.float_regs) for p in call_image.placements]}")
+    big_image = am.pack_return(big_ret, big_value, result_buf)
+    rebuilt_return = am.unpack_return(big_ret, big_image, result_buf)
+    print(f"  big {big_ret.name}: kind={big_image.kind} size={big_image.size} "
+          f"int_regs[0]=0x{big_image.int_regs[0]:x}")
+    print(f"  result buffer raw bytes = {result_buf.contents.hex()}")
+    print(f"  rebuilt big return = {rebuilt_return}")
+    assert rebuilt_return == big_value
+
+    print("\n== 5. 越界拒绝演示 ==")
     try:
         am.pack_call([(am.UINT8, 300)])
         print("  ERROR: 未触发拒绝！")

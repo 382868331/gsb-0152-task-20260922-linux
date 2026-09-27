@@ -14,7 +14,8 @@
 * 空记录不消耗寄存器也不消耗栈。
 
 公开接口：类型构造（IntType/FloatType/PtrType/ArrayType/RecordType 及常量）、
-layout()、classify()、encode()、decode()、pack_call()、unpack_call()。
+layout()、classify()、encode()、decode()、参数编组 pack_call()/
+unpack_call()，以及返回值编组 ResultBuffer、pack_return()、unpack_return()。
 
 错误语义：所有非法输入抛出 ABIError 子类，并尽量携带可定位的 path
 （如 ``arg[2].samples[3]``）。不做静默纠正：整数溢出、bool 冒充整数、
@@ -45,7 +46,9 @@ __all__ = [
     "Layout", "FieldLayout", "layout", "classify",
     # 编组
     "Placement", "CallImage",
+    "ReturnImage", "ResultBuffer", "DEFAULT_RESULT_ADDRESS",
     "encode", "decode", "pack_call", "unpack_call",
+    "pack_return", "unpack_return",
 ]
 
 # ---------------------------------------------------------------------------
@@ -519,14 +522,22 @@ class CallImage:
     float_regs: tuple
     stack: bytes
     placements: tuple[Placement, ...]
+    sret_pointer: Placement | None = None
+    result_address: int | None = None
 
 
-def pack_call(args) -> CallImage:
+def pack_call(args, return_type: Type | None = None,
+              result_buffer: "ResultBuffer | None" = None) -> CallImage:
     """把 ``[(Type, value), ...]`` 编组为寄存器 + 栈映像。
 
     逐参数：size 为 0 的聚合不占资源；超过 16 字节走栈；否则按块申请
     寄存器，寄存器不足时整体走 16 字节对齐的栈且不消耗寄存器。
     任一参数非法时整体抛错，不返回部分结果。
+
+    若提供 ``return_type`` 且返回类型超过 16 字节（``MEMORY`` 类），调用方
+    必须同时提供接收大结果的 ``result_buffer``；其地址作为隐藏的第一个
+    指针参数，先于所有显式参数参与同一套寄存器/栈分配，因此后续参数的
+    寄存器与栈位置会相应顺延。空返回类型不需要结果空间。
     """
     if not isinstance(args, (list, tuple)):
         raise InvalidValueError(
@@ -534,6 +545,25 @@ def pack_call(args) -> CallImage:
     if len(args) > MAX_ARGS:
         raise InvalidValueError(
             f"too many arguments: {len(args)} > limit {MAX_ARGS}")
+
+    sret_t = None
+    sret_address = None
+    if return_type is not None:
+        _check_type(return_type)
+        ret_lay = layout(return_type)
+        ret_cls = classify(return_type)
+        if ret_cls == (MEMORY,):
+            if not isinstance(result_buffer, ResultBuffer):
+                raise InvalidValueError(
+                    "MEMORY-class return type requires a caller-provided "
+                    f"ResultBuffer for {return_type.name}", "return")
+            result_buffer.check_type(return_type, ret_lay)
+            sret_t = return_type
+            sret_address = result_buffer.address
+        elif result_buffer is not None:
+            raise InvalidValueError(
+                "result_buffer is only valid for a MEMORY-class return type; "
+                f"{return_type.name} is returned in registers", "return")
 
     int_regs: list = [None] * INT_REG_COUNT
     float_regs: list = [None] * FLOAT_REG_COUNT
@@ -548,18 +578,27 @@ def pack_call(args) -> CallImage:
         stack.extend(data)
         return Placement("stack", cls, (), (), off, size)
 
+    visible_items: list[tuple[str, Type, object]] = []
     for i, item in enumerate(args):
         if not (isinstance(item, tuple) and len(item) == 2):
             raise InvalidValueError(
                 f"each argument must be a (Type, value) pair, got {item!r}",
                 f"arg[{i}]")
-        t, value = item
+        visible_items.append((f"arg[{i}]", item[0], item[1]))
+
+    items: list[tuple[str, Type, object]] = []
+    if sret_t is not None:
+        items.append(("return.address", PTR, sret_address))
+    items.extend(visible_items)
+
+    sret_pointer = None
+    for seq, (item_path, t, value) in enumerate(items):
         try:
             _check_type(t)
             lay = layout(t)
         except ABIError as exc:
-            raise type(exc)(exc.message, f"arg[{i}]") from None
-        data = encode(t, value, lay, path=f"arg[{i}]")
+            raise type(exc)(exc.message, item_path) from None
+        data = encode(t, value, lay, path=item_path)
         cls = classify(t)
 
         if not cls:
@@ -592,9 +631,13 @@ def pack_call(args) -> CallImage:
             # 寄存器不足：整体走栈，不消耗任何寄存器。
             placements.append(to_stack(data, cls, lay.size))
 
+        if sret_t is not None and seq == 0:
+            sret_pointer = placements[-1]
+
     stack.extend(b"\x00" * (-len(stack) % STACK_ALIGN))
+    visible_placements = placements[1:] if sret_t is not None else placements
     return CallImage(tuple(int_regs), tuple(float_regs), bytes(stack),
-                     tuple(placements))
+                     tuple(visible_placements), sret_pointer, sret_address)
 
 
 def unpack_call(types, image: CallImage) -> list:
@@ -637,3 +680,231 @@ def unpack_call(types, image: CallImage) -> list:
             raise InvalidValueError(f"unknown placement kind {pl.kind!r}", path)
         values.append(decode(t, data, lay, path))
     return values
+
+
+# ---------------------------------------------------------------------------
+# 返回值编组：寄存器结果 + 调用方提供的大结果空间
+# ---------------------------------------------------------------------------
+
+DEFAULT_RESULT_ADDRESS = 0x7F0000001000
+
+
+class ResultBuffer:
+    """调用方为 MEMORY 类返回值提供的合成接收空间（不访问真实内存）。
+
+    地址必须为非负 64 位整数，并按 16 字节对齐；容量严格等于返回类型的
+    完整布局字节数，包含嵌套记录/数组之间的间隙与尾部填充。
+    """
+
+    __slots__ = ("_type", "_layout", "_address", "_data")
+
+    def __init__(self, t: Type, address: int = DEFAULT_RESULT_ADDRESS):
+        _check_type(t)
+        lay = layout(t)
+        if classify(t) != (MEMORY,):
+            raise InvalidTypeError(
+                f"result buffer is only for MEMORY-class types, got {t.name} "
+                f"(size={lay.size})")
+        if isinstance(address, bool) or not isinstance(address, int):
+            raise InvalidValueError(
+                f"result address must be an int, got {address!r}")
+        if not 0 <= address <= (1 << 64) - 1:
+            raise IntegerOverflowError(
+                f"result address {address} out of range [0, 2**64 - 1]")
+        if address % STACK_ALIGN != 0:
+            raise InvalidValueError(
+                f"result address 0x{address:x} must be {STACK_ALIGN}-byte "
+                "aligned")
+        self._type = t
+        self._layout = lay
+        self._address = address
+        self._data = b""
+
+    @property
+    def type(self) -> Type:
+        return self._type
+
+    @property
+    def layout(self) -> Layout:
+        return self._layout
+
+    @property
+    def address(self) -> int:
+        return self._address
+
+    @property
+    def contents(self) -> bytes:
+        """返回已写入的完整布局字节；尚未接收大结果时抛错。"""
+        return self._read()
+
+    def check_type(self, t: Type, lay: Layout | None = None) -> None:
+        _check_type(t)
+        if lay is None:
+            lay = layout(t)
+        if t != self._type or lay.size != self._layout.size:
+            raise InvalidTypeError(
+                f"result buffer was created for {self._type.name} "
+                f"({self._layout.size} bytes), cannot use it for {t.name} "
+                f"({lay.size} bytes)", "return")
+
+    def _write(self, data: bytes) -> None:
+        if len(data) != self._layout.size:
+            raise InvalidValueError(
+                f"result payload length {len(data)} != buffer size "
+                f"{self._layout.size}", "return")
+        self._data = bytes(data)
+
+    def _read(self) -> bytes:
+        if len(self._data) != self._layout.size:
+            raise InvalidValueError(
+                f"result buffer at 0x{self._address:x} has not received "
+                f"{self._layout.size} bytes", "return")
+        return self._data
+
+
+@dataclass(frozen=True)
+class ReturnImage:
+    """一次返回的完整编组映像。
+
+    kind 为 ``registers`` 时，块按 ``eightbytes`` 分别进入 int/float 寄存器；
+    kind 为 ``memory`` 时，地址在 ``int_regs[0]``，完整内容在结果空间中；
+    kind 为 ``none`` 时为空记录返回。
+    """
+
+    kind: str
+    eightbytes: tuple[str, ...]
+    int_regs: tuple
+    float_regs: tuple
+    size: int = 0
+    result_address: int | None = None
+
+
+def pack_return(return_type: Type, value,
+                result_buffer: ResultBuffer | None = None) -> ReturnImage:
+    """把返回值按与参数相同的 8 字节块规则编组。
+
+    空记录不占寄存器；不超过 16 字节的标量/记录/数组进入寄存器；超过
+    16 字节的大结果写入调用方预先提供的 ``ResultBuffer``，并在第一个整数
+    寄存器中回传其地址。
+    """
+    _check_type(return_type)
+    lay = layout(return_type)
+    data = encode(return_type, value, lay, path="return")
+    cls = classify(return_type)
+
+    if not cls:
+        if result_buffer is not None:
+            raise InvalidValueError(
+                "result_buffer is not valid for an empty return type",
+                "return")
+        return ReturnImage("none", (),
+                           (None,) * INT_REG_COUNT,
+                           (None,) * FLOAT_REG_COUNT)
+
+    if cls == (MEMORY,):
+        if not isinstance(result_buffer, ResultBuffer):
+            raise InvalidValueError(
+                "MEMORY-class return requires the caller-provided "
+                f"ResultBuffer for {return_type.name}", "return")
+        result_buffer.check_type(return_type, lay)
+        result_buffer._write(data)
+        int_regs = [None] * INT_REG_COUNT
+        int_regs[0] = result_buffer.address
+        return ReturnImage("memory", (MEMORY,), tuple(int_regs),
+                           (None,) * FLOAT_REG_COUNT, lay.size,
+                           result_buffer.address)
+
+    if result_buffer is not None:
+        raise InvalidValueError(
+            "result_buffer is only valid for a MEMORY-class return type; "
+            f"{return_type.name} is returned in registers", "return")
+
+    int_regs: list = [None] * INT_REG_COUNT
+    float_regs: list = [None] * FLOAT_REG_COUNT
+    next_int = 0
+    next_float = 0
+    for k, c in enumerate(cls):
+        chunk = data[8 * k:8 * k + 8].ljust(8, b"\x00")
+        if c == INTEGER:
+            int_regs[next_int] = int.from_bytes(chunk, "little")
+            next_int += 1
+        else:
+            float_regs[next_float] = struct.unpack("<d", chunk)[0]
+            next_float += 1
+    return ReturnImage("registers", cls, tuple(int_regs), tuple(float_regs),
+                       lay.size)
+
+
+def unpack_return(return_type: Type, image: ReturnImage,
+                  result_buffer: ResultBuffer | None = None):
+    """从返回映像（必要时连同结果空间）重建 Python 返回值。"""
+    _check_type(return_type)
+    if not isinstance(image, ReturnImage):
+        raise InvalidValueError(f"expected a ReturnImage, got {image!r}")
+    lay = layout(return_type)
+    cls = classify(return_type)
+
+    if not cls:
+        if image.kind != "none":
+            raise InvalidValueError(
+                f"empty return type expects kind=none, got {image.kind!r}",
+                "return")
+        return decode(return_type, b"", lay, "return")
+
+    if cls == (MEMORY,):
+        if image.kind != "memory":
+            raise InvalidValueError(
+                f"{return_type.name} expects kind=memory, got {image.kind!r}",
+                "return")
+        if not isinstance(result_buffer, ResultBuffer):
+            raise InvalidValueError(
+                "unpacking a MEMORY-class return requires the matching "
+                "ResultBuffer", "return")
+        result_buffer.check_type(return_type, lay)
+        if image.result_address != result_buffer.address:
+            raise InvalidValueError(
+                f"return address 0x{image.result_address:x} does not match "
+                f"buffer address 0x{result_buffer.address:x}", "return")
+        if image.int_regs[0] != result_buffer.address:
+            raise InvalidValueError(
+                "first integer register does not contain the result address",
+                "return")
+        data = result_buffer._read()
+        return decode(return_type, data, lay, "return")
+
+    if image.kind != "registers":
+        raise InvalidValueError(
+            f"{return_type.name} expects kind=registers, got {image.kind!r}",
+            "return")
+    if image.eightbytes != cls:
+        raise InvalidValueError(
+            f"return classes {image.eightbytes} do not match {cls}", "return")
+    chunks: list[bytes] = []
+    next_int = 0
+    next_float = 0
+    for c in cls:
+        if c == INTEGER:
+            value = image.int_regs[next_int]
+            next_int += 1
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise InvalidValueError(
+                    f"expected integer return register value, got {value!r}",
+                    "return")
+            if not 0 <= value <= (1 << 64) - 1:
+                raise IntegerOverflowError(
+                    f"return register value {value} is not an unsigned 64-bit "
+                    "block", "return")
+            chunks.append(value.to_bytes(8, "little"))
+        else:
+            value = image.float_regs[next_float]
+            next_float += 1
+            if not isinstance(value, float) or isinstance(value, bool):
+                raise InvalidValueError(
+                    f"expected float return register value, got {value!r}",
+                    "return")
+            if not math.isfinite(value):
+                raise NonFiniteFloatError(
+                    f"non-finite return register value {value!r}", "return")
+            chunks.append(struct.pack("<d", value))
+    data = b"".join(chunks)[:lay.size]
+    return decode(return_type, data, lay, "return")
