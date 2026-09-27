@@ -442,6 +442,217 @@ class TestRoundTrip(unittest.TestCase):
             am.unpack_call([big], bad)
 
 
+class TestResultRegister(unittest.TestCase):
+    """小返回值逐块进入结果寄存器。"""
+
+    def test_scalar_result_registers(self):
+        for t, value, slot, expected in [
+            (am.UINT64, 0x0102030405060708, "int", 0x0102030405060708),
+            (am.INT32, -12, "int", (1 << 32) - 12),
+            (am.UINT8, 0x7F, "int", 0x7F),
+            (am.PTR, 0xDEAD, "int", 0xDEAD),
+            (am.DOUBLE, -1.25, "float", -1.25),
+        ]:
+            img = am.pack_callsite(t, [])
+            self.assertEqual(img.arg_base, 0)
+            out = am.write_result(t, img, value)
+            if slot == "int":
+                self.assertEqual(out.int_regs[0], expected, t.name)
+            else:
+                self.assertEqual(out.float_regs[0], expected, t.name)
+            self.assertEqual(am.unpack_result(t, out), value)
+
+    def test_small_aggregate_result_uses_block_classes(self):
+        r = rec("RRet", [("d", am.DOUBLE), ("i", am.INT32)])
+        img = am.pack_callsite(r, [])
+        rp = img.result_placement
+        self.assertEqual(rp.kind, "registers")
+        self.assertEqual(rp.eightbytes, (am.FLOAT, am.INTEGER))
+        self.assertEqual(rp.int_regs, (0,))
+        self.assertEqual(rp.float_regs, (0,))
+        out = am.write_result(r, img, {"d": 4.0, "i": 0x1234})
+        self.assertEqual(out.float_regs[0], 4.0)
+        self.assertEqual(out.int_regs[0], 0x1234)
+        self.assertEqual(am.unpack_result(r, out), {"d": 4.0, "i": 0x1234})
+
+    def test_exact_16_byte_result_stays_in_registers(self):
+        ff = rec("FFRet", [("a", am.DOUBLE), ("b", am.DOUBLE)])
+        img = am.pack_callsite(ff, [])
+        self.assertEqual(img.result_placement.kind, "registers")
+        out = am.write_result(ff, img, {"a": 1.0, "b": 2.0})
+        self.assertEqual(out.float_regs, (1.0, 2.0))
+
+    def test_array_result_small_and_memory(self):
+        a16 = am.ArrayType(am.UINT8, 16)
+        img = am.pack_callsite(a16, [])
+        self.assertEqual(img.result_placement.kind, "registers")
+        vals = list(range(16))
+        out = am.write_result(a16, img, vals)
+        self.assertEqual(am.unpack_result(a16, out), vals)
+
+        a17 = am.ArrayType(am.UINT8, 17)
+        img17 = am.pack_callsite(a17, [])
+        self.assertEqual(img17.result_placement.kind, "memory")
+
+    def test_tail_padding_zero_fills_result_block(self):
+        # {u64, u8} size=16：第二块只有低字节有效，其余 7 字节零填充。
+        r = rec("PadRet", [("a", am.UINT64), ("b", am.UINT8)])
+        img = am.pack_callsite(r, [])
+        out = am.write_result(r, img, {"a": 1, "b": 0xAA})
+        self.assertEqual(out.int_regs, (1, 0xAA, None, None))
+        self.assertEqual(am.unpack_result(r, out), {"a": 1, "b": 0xAA})
+
+    def test_empty_record_result_is_none(self):
+        empty = rec("EmptyRet", [])
+        img = am.pack_callsite(empty, [(am.INT64, 3)])
+        self.assertEqual(img.result_placement.kind, "none")
+        self.assertEqual(img.arg_base, 0)
+        self.assertEqual(len(img.placements), 1)
+        out = am.write_result(empty, img, {})
+        self.assertEqual(am.unpack_result(empty, out), {})
+
+
+class TestResultMemory(unittest.TestCase):
+    """大返回值：调用方缓冲区 + 隐式 sret 指针首参。"""
+
+    def test_buffer_allocated_and_address_is_first_arg(self):
+        big = rec("BigRet", [("a", am.DOUBLE), ("b", am.DOUBLE),
+                             ("c", am.DOUBLE)])
+        img = am.pack_callsite(big, [(am.INT64, 55), (am.DOUBLE, 7.5)])
+        rp = img.result_placement
+        self.assertEqual(rp.kind, "memory")
+        self.assertEqual(rp.size, 24)
+        self.assertEqual(rp.align, 8)
+        self.assertEqual(rp.address, am.RESULT_BUFFER_BASE)
+        self.assertEqual(img.result_buffer, b"\x00" * 24)
+        self.assertEqual(img.arg_base, 1)
+        # 隐式首参：指针、整数寄存器 0、标记 sret
+        p0 = img.placements[0]
+        self.assertTrue(p0.sret)
+        self.assertEqual(p0.kind, "registers")
+        self.assertEqual(p0.int_regs, (0,))
+        self.assertEqual(img.int_regs[0], am.RESULT_BUFFER_BASE)
+        # 显式实参顺延一个寄存器位置
+        self.assertEqual(img.placements[1].int_regs, (1,))
+        self.assertEqual(img.placements[2].float_regs, (0,))
+
+    def test_explicit_args_shift_when_registers_full(self):
+        big = rec("BigRet2", [("a", am.DOUBLE), ("b", am.DOUBLE),
+                              ("c", am.DOUBLE)])
+        # sret 占 1 个整数寄存器后，4 个显式 i64 里最后一个必须走栈。
+        args = [(am.INT64, i) for i in (10, 20, 30, 40)]
+        img = am.pack_callsite(big, args)
+        kinds = [(p.kind, p.sret) for p in img.placements]
+        self.assertEqual(kinds,
+                         [("registers", True), ("registers", False),
+                          ("registers", False), ("registers", False),
+                          ("stack", False)])
+        # 不带大返回值时 4 个 i64 全部在寄存器中（对照）
+        ref = am.pack_call(args)
+        self.assertTrue(all(p.kind == "registers" for p in ref.placements))
+        # 解包时隐式槽被自动跳过
+        self.assertEqual(am.unpack_call([am.INT64] * 4, img),
+                         [10, 20, 30, 40])
+
+    def test_nested_record_and_array_rebuilt_with_alignment(self):
+        # 独立参考地手工计算嵌套结果的期望字节（不调用被测核心生成期望）。
+        inner = rec("InRet", [("x", am.UINT8), ("y", am.DOUBLE)])
+        pkt = rec("PktRet", [("hd", inner),
+                             ("samples", am.ArrayType(am.INT16, 4))])
+        # inner: x@0, pad 1..7, y@8, size16；samples@16 占 8 字节；总 size24
+        _ref_off, ref_size, _ref_align = ref_record_layout(
+            [("hd", 16, 8), ("samples", 8, 2)])
+        self.assertEqual(ref_size, am.layout(pkt).size)
+        img = am.pack_callsite(pkt, [])
+        value = {"hd": {"x": 7, "y": 3.5}, "samples": [-1, 2, -3, 4]}
+        out = am.write_result(pkt, img, value)
+        # 独立构造期望字节串：x=7@0、填充零、y=3.5@8、samples@16
+        expected = bytearray(24)
+        expected[0] = 7
+        expected[8:16] = struct.pack("<d", 3.5)
+        for j, sv in enumerate([-1, 2, -3, 4]):
+            expected[16 + 2 * j:18 + 2 * j] = struct.pack("<h", sv)
+        self.assertEqual(bytes(out.result_buffer), bytes(expected))
+        # 填充字节必须为零（7 字节内部填充）
+        self.assertEqual(out.result_buffer[1:8], b"\x00" * 7)
+        self.assertEqual(am.unpack_result(pkt, out), value)
+
+    def test_result_buffer_address_range(self):
+        # 合成地址必须是合法的 64 位无符号指针
+        self.assertLess(am.RESULT_BUFFER_BASE, 1 << 64)
+
+    def test_memory_result_does_not_clobber_arg_registers(self):
+        big = rec("BigRet3", [("a", am.DOUBLE), ("b", am.DOUBLE),
+                              ("c", am.DOUBLE)])
+        img = am.pack_callsite(big, [(am.INT64, 99)])
+        before = img.int_regs
+        out = am.write_result(big, img, {"a": 1.0, "b": 2.0, "c": 3.0})
+        self.assertEqual(out.int_regs, before)
+        self.assertEqual(out.float_regs, img.float_regs)
+        self.assertEqual(out.stack, img.stack)
+
+
+class TestResultErrors(unittest.TestCase):
+    def test_pack_call_image_has_no_result_placement(self):
+        img = am.pack_call([(am.INT64, 1)])
+        self.assertIsNone(img.result_placement)
+        with self.assertRaises(am.InvalidValueError):
+            am.write_result(am.INT64, img, 1)
+        with self.assertRaises(am.InvalidValueError):
+            am.unpack_result(am.INT64, img)
+
+    def test_return_value_validation_rejected(self):
+        r = rec("VRet", [("a", am.UINT8), ("b", am.DOUBLE)])
+        img = am.pack_callsite(r, [])
+        with self.assertRaises(am.IntegerOverflowError) as ctx:
+            am.write_result(r, img, {"a": 300, "b": 1.0})
+        self.assertEqual(ctx.exception.path, "result.a")
+        with self.assertRaises(am.NonFiniteFloatError):
+            am.write_result(r, img, {"a": 1, "b": float("nan")})
+        with self.assertRaises(am.InvalidValueError):
+            am.write_result(r, img, {"a": 1})
+
+    def test_return_type_mismatch_rejected(self):
+        img = am.pack_callsite(am.INT64, [])
+        with self.assertRaises(am.InvalidTypeError):
+            am.write_result(am.INT32, img, 1)
+        big = rec("MBig", [("a", am.DOUBLE), ("b", am.DOUBLE),
+                           ("c", am.DOUBLE)])
+        img2 = am.pack_callsite(big, [])
+        with self.assertRaises(am.InvalidTypeError):
+            am.unpack_result(am.INT64, img2)
+        with self.assertRaises(am.InvalidTypeError):
+            am.write_result(am.INT64, img2, 1)
+
+    def test_unpopulated_result_register_rejected(self):
+        img = am.pack_callsite(am.INT64, [])
+        # 调用点映像中结果寄存器尚未写入 -> 重建拒绝
+        with self.assertRaises(am.InvalidValueError):
+            am.unpack_result(am.INT64, img)
+
+    def test_result_round_trip_many_shapes(self):
+        empty = rec("ER0", [])
+        shapes = [
+            (am.UINT8, 200),
+            (am.INT64, -(1 << 40)),
+            (am.DOUBLE, 3.125),
+            (am.PTR, 0x1234_5678_9ABC_DEF0),
+            (am.ArrayType(am.INT16, 4), [-5, 6, -7, 8]),
+            (rec("S0", [("a", am.UINT32), ("d", am.DOUBLE)]),
+             {"a": 99, "d": -0.5}),
+            (empty, {}),
+            (rec("M0", [("xs", am.ArrayType(am.UINT8, 20))]),
+             {"xs": list(range(20))}),
+        ]
+        for t, v in shapes:
+            img = am.pack_callsite(t, [(am.INT64, 1), (am.DOUBLE, 1.0)])
+            # 参数先解包（模拟进入函数时），再写返回值
+            self.assertEqual(am.unpack_call([am.INT64, am.DOUBLE], img),
+                             [1, 1.0])
+            out = am.write_result(t, img, v)
+            self.assertEqual(am.unpack_result(t, out), v, t.name)
+
+
 class TestEncodeBytes(unittest.TestCase):
     def test_scalar_encoding_little_endian(self):
         self.assertEqual(am.encode(am.UINT16, 0x1234), b"\x34\x12")

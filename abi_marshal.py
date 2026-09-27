@@ -13,8 +13,16 @@
   16 字节对齐的栈，且不消耗任何寄存器；
 * 空记录不消耗寄存器也不消耗栈。
 
+返回值沿用同一套分类/对齐规则：小结果（<=16 字节的非空标量或聚合）
+逐块放入调用结果寄存器；大结果（MEMORY，>16 字节）由调用方提供一块
+自然对齐的缓冲区，其地址作为隐式指针实参占用**第一个参数位置**，随后
+的显式实参依次后移；空记录没有返回值，不占任何资源。本模块只模拟该
+合成调用模型，不对接真实硬件：缓冲区由 CallImage 自带的 result_buffer
+字节串表示，地址是合成地址空间中的确定性常量。
+
 公开接口：类型构造（IntType/FloatType/PtrType/ArrayType/RecordType 及常量）、
-layout()、classify()、encode()、decode()、pack_call()、unpack_call()。
+layout()、classify()、encode()、decode()、pack_call()、unpack_call()、
+pack_callsite()、write_result()、unpack_result()。
 
 错误语义：所有非法输入抛出 ABIError 子类，并尽量携带可定位的 path
 （如 ``arg[2].samples[3]``）。不做静默纠正：整数溢出、bool 冒充整数、
@@ -26,7 +34,7 @@ from __future__ import annotations
 import math
 import struct
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 
 __all__ = [
     # 常量
@@ -45,7 +53,9 @@ __all__ = [
     "Layout", "FieldLayout", "layout", "classify",
     # 编组
     "Placement", "CallImage",
+    "ResultPlacement", "RESULT_BUFFER_BASE",
     "encode", "decode", "pack_call", "unpack_call",
+    "pack_callsite", "write_result", "unpack_result",
 ]
 
 # ---------------------------------------------------------------------------
@@ -65,6 +75,10 @@ MAX_ARGS = 1024                 # 单次调用最多参数个数
 MAX_ARRAY_COUNT = 65536         # 数组最大元素数
 MAX_RECORD_FIELDS = 256         # 记录最大字段数
 MAX_TYPE_SIZE = 1 << 20         # 任一类型完整布局最大字节数（1 MiB）
+
+# 合成调用模型中调用方结果缓冲区所在的合成地址空间基址。仅用于在调用
+# 映像中以 8 字节无符号指针表示缓冲区地址，不对应任何真实内存。
+RESULT_BUFFER_BASE = 0x7F00_0000_0000
 
 _INT_SIZES = (1, 2, 4, 8)
 
@@ -503,6 +517,25 @@ class Placement:
     float_regs: tuple[int, ...] = ()
     stack_offset: int | None = None
     size: int = 0
+    sret: bool = False  # 大返回值缓冲区地址的隐式首参
+
+
+@dataclass(frozen=True)
+class ResultPlacement:
+    """返回值的安放规则（在调用点即确定，与返回值本身无关）。
+
+    kind: ``"registers"`` / ``"memory"`` / ``"none"``（空记录）。
+    memory 时 address 是调用方缓冲区的合成地址，align 是缓冲区对齐；
+    registers 时 int_regs/float_regs 是结果占用的寄存器槽下标（从 0 起）。
+    """
+
+    kind: str
+    eightbytes: tuple[str, ...]
+    int_regs: tuple[int, ...] = ()
+    float_regs: tuple[int, ...] = ()
+    address: int | None = None
+    size: int = 0
+    align: int = 1
 
 
 @dataclass(frozen=True)
@@ -519,21 +552,54 @@ class CallImage:
     float_regs: tuple
     stack: bytes
     placements: tuple[Placement, ...]
+    # 以下字段仅在 pack_callsite 产出的调用点映像中出现；pack_call 产物中
+    # result_placement 为 None、result_buffer 为空、arg_base 为 0。
+    result_placement: ResultPlacement | None = None
+    result_buffer: bytes = b""
+    arg_base: int = 0  # 隐式 sret 指针实参的个数（0 或 1）
 
 
-def pack_call(args) -> CallImage:
-    """把 ``[(Type, value), ...]`` 编组为寄存器 + 栈映像。
-
-    逐参数：size 为 0 的聚合不占资源；超过 16 字节走栈；否则按块申请
-    寄存器，寄存器不足时整体走 16 字节对齐的栈且不消耗寄存器。
-    任一参数非法时整体抛错，不返回部分结果。
-    """
+def _validate_arg_list(args) -> None:
     if not isinstance(args, (list, tuple)):
         raise InvalidValueError(
             f"args must be a list/tuple of (Type, value) pairs, got {args!r}")
     if len(args) > MAX_ARGS:
         raise InvalidValueError(
             f"too many arguments: {len(args)} > limit {MAX_ARGS}")
+
+
+def _pack_image(args, return_type) -> CallImage:
+    """编组核心：可选地预置大返回值的隐式缓冲区指针首参。"""
+    _validate_arg_list(args)
+
+    result_placement: ResultPlacement | None = None
+    result_buffer = b""
+    arg_base = 0
+    packed_args: list = list(args)
+
+    if return_type is not None:
+        _check_type(return_type)
+        rlay = layout(return_type)
+        rcls = classify(return_type)
+        if not rcls:
+            result_placement = ResultPlacement("none", (), (), (), None, 0,
+                                               rlay.align)
+        elif rcls == (MEMORY,):
+            # 调用方提供一块自然对齐的结果空间；地址占用第一个参数位置，
+            # 随后的显式实参统一后移一位（arg_base=1）。
+            result_buffer = b"\x00" * rlay.size
+            result_placement = ResultPlacement(
+                "memory", rcls, (), (), RESULT_BUFFER_BASE, rlay.size,
+                rlay.align)
+            packed_args = [(PTR, RESULT_BUFFER_BASE)] + packed_args
+            arg_base = 1
+        else:
+            # 小结果总是从 0 号结果寄存器起安放（与实参寄存器池共享编号，
+            # 但在返回点单独观察），<=16 字节必然放得下。
+            ri = tuple(range(rcls.count(INTEGER)))
+            rf = tuple(range(rcls.count(FLOAT)))
+            result_placement = ResultPlacement(
+                "registers", rcls, ri, rf, None, rlay.size, rlay.align)
 
     int_regs: list = [None] * INT_REG_COUNT
     float_regs: list = [None] * FLOAT_REG_COUNT
@@ -548,25 +614,31 @@ def pack_call(args) -> CallImage:
         stack.extend(data)
         return Placement("stack", cls, (), (), off, size)
 
-    for i, item in enumerate(args):
+    for i, item in enumerate(packed_args):
         if not (isinstance(item, tuple) and len(item) == 2):
             raise InvalidValueError(
                 f"each argument must be a (Type, value) pair, got {item!r}",
                 f"arg[{i}]")
         t, value = item
+        is_hidden_sret = arg_base == 1 and i == 0
         try:
             _check_type(t)
             lay = layout(t)
         except ABIError as exc:
             raise type(exc)(exc.message, f"arg[{i}]") from None
-        data = encode(t, value, lay, path=f"arg[{i}]")
+        sret_path = "__sret__" if is_hidden_sret else f"arg[{i - arg_base}]"
+        data = encode(t, value, lay, path=sret_path)
         cls = classify(t)
 
         if not cls:
-            placements.append(Placement("none", (), (), (), None, 0))
+            placements.append(Placement("none", (), (), (), None, 0,
+                                        is_hidden_sret))
             continue
         if cls == (MEMORY,):
-            placements.append(to_stack(data, cls, lay.size))
+            pl = to_stack(data, cls, lay.size)
+            placements.append(
+                Placement(pl.kind, pl.eightbytes, pl.int_regs, pl.float_regs,
+                          pl.stack_offset, pl.size, is_hidden_sret))
             continue
 
         need_int = cls.count(INTEGER)
@@ -587,30 +659,69 @@ def pack_call(args) -> CallImage:
                     next_float += 1
             placements.append(
                 Placement("registers", cls, tuple(iregs), tuple(fregs),
-                          None, lay.size))
+                          None, lay.size, is_hidden_sret))
         else:
             # 寄存器不足：整体走栈，不消耗任何寄存器。
-            placements.append(to_stack(data, cls, lay.size))
+            pl = to_stack(data, cls, lay.size)
+            placements.append(
+                Placement(pl.kind, pl.eightbytes, pl.int_regs, pl.float_regs,
+                          pl.stack_offset, pl.size, is_hidden_sret))
 
     stack.extend(b"\x00" * (-len(stack) % STACK_ALIGN))
     return CallImage(tuple(int_regs), tuple(float_regs), bytes(stack),
-                     tuple(placements))
+                     tuple(placements), result_placement,
+                     bytes(result_buffer), arg_base)
+
+
+def pack_call(args) -> CallImage:
+    """把 ``[(Type, value), ...]`` 编组为寄存器 + 栈映像（无返回值槽）。
+
+    逐参数：size 为 0 的聚合不占资源；超过 16 字节走栈；否则按块申请
+    寄存器，寄存器不足时整体走 16 字节对齐的栈且不消耗寄存器。
+    任一参数非法时整体抛错，不返回部分结果。
+    """
+    return _pack_image(args, None)
+
+
+def pack_callsite(return_type, args) -> CallImage:
+    """调用点编组：在参数映像之外再安排返回值的接收位置。
+
+    返回值按与实参相同的规则分类：
+
+    * 空记录：无返回值，不占寄存器/缓冲区，显式实参位置不变；
+    * <=16 字节的标量或聚合：逐块进入从 0 起的结果寄存器（记录于
+      ``image.result_placement``），显式实参位置不变；
+    * >16 字节（MEMORY）：调用方提供一块按该类型自然对齐的缓冲区，
+      其 8 字节地址作为隐式指针实参占据第一个参数位置，其后的每个
+      显式实参顺延一个寄存器/栈位置（``arg_base=1``）。
+
+    缓冲区是合成模型自带的 ``result_buffer`` 字节串（初值全零），其
+    地址是合成地址空间常量，不涉及真实硬件内存。
+    """
+    return _pack_image(args, return_type)
 
 
 def unpack_call(types, image: CallImage) -> list:
-    """按 ``types`` 从 ``image`` 重建实参值列表（``pack_call`` 的逆）。"""
+    """按 ``types`` 从 ``image`` 重建显式实参值列表。
+
+    若映像由 ``pack_callsite`` 为大返回值预置了隐式 sret 指针首参
+    （``arg_base=1``），该槽会被自动跳过，调用方传入的 ``types`` 只列
+    显式实参。注意：寄存器映像反映的是进入函数时的现场，若随后用
+    ``write_result`` 覆写了结果寄存器，应先解出参数再写返回值。
+    """
     if not isinstance(image, CallImage):
         raise InvalidValueError(f"expected a CallImage, got {image!r}")
     if not isinstance(types, (list, tuple)):
         raise InvalidValueError(
             f"types must be a list/tuple of Type, got {types!r}")
-    if len(types) != len(image.placements):
+    visible = image.placements[image.arg_base:]
+    if len(types) != len(visible):
         raise InvalidValueError(
-            f"{len(types)} types but image has {len(image.placements)} "
-            "placements")
+            f"{len(types)} types but image has {len(visible)} visible "
+            f"placements (arg_base={image.arg_base})")
 
     values = []
-    for i, (t, pl) in enumerate(zip(types, image.placements)):
+    for i, (t, pl) in enumerate(zip(types, visible)):
         _check_type(t)
         lay = layout(t)
         path = f"arg[{i}]"
@@ -637,3 +748,126 @@ def unpack_call(types, image: CallImage) -> list:
             raise InvalidValueError(f"unknown placement kind {pl.kind!r}", path)
         values.append(decode(t, data, lay, path))
     return values
+
+
+def write_result(return_type, image: CallImage, value) -> CallImage:
+    """被调方侧：按调用点映像的安放规则写入返回值，返回返回点新映像。
+
+    * 小结果（registers）：按 8 字节块写入 0 号起的整数/浮点结果寄存器，
+      其余寄存器槽保持进入时的值（合成模型不模拟调用方保存寄存器）；
+    * 大结果（memory）：把按 ``return_type`` 编码（含嵌套记录/数组的
+      对齐与尾填充）的完整字节写入调用方缓冲区 ``result_buffer``，
+      寄存器与栈映像不变；
+    * 空记录（none）：映像原样返回，值必须是与空记录匹配的 ``{}``。
+
+    值校验失败时整体抛错，返回的映像不存在部分写入。
+    """
+    if not isinstance(image, CallImage):
+        raise InvalidValueError(f"expected a CallImage, got {image!r}")
+    rp = image.result_placement
+    if rp is None:
+        raise InvalidValueError(
+            "image has no result placement; use pack_callsite() to model "
+            "a return value")
+    _check_type(return_type)
+    lay = layout(return_type)
+    if classify(return_type) != rp.eightbytes:
+        # 安放规则必须与调用点声明的返回类型逐块一致（含 () 空记录）。
+        raise InvalidTypeError(
+            f"return type {return_type.name!r} does not match the callsite "
+            f"result placement {rp.eightbytes}")
+    if lay.size != rp.size:
+        raise InvalidTypeError(
+            f"return type {return_type.name!r} size {lay.size} does not "
+            f"match the callsite result size {rp.size}")
+    data = encode(return_type, value, lay, path="result")
+
+    if rp.kind == "none":
+        return image
+
+    if rp.kind == "memory":
+        if len(data) != rp.size:
+            raise InvalidTypeError(
+                f"encoded result size {len(data)} != buffer size {rp.size}")
+        return dataclasses_replace(image, result_buffer=bytes(data))
+
+    if rp.kind == "registers":
+        int_regs = list(image.int_regs)
+        float_regs = list(image.float_regs)
+        int_iter = iter(rp.int_regs)
+        float_iter = iter(rp.float_regs)
+        for k, c in enumerate(rp.eightbytes):
+            chunk = data[8 * k:8 * k + 8].ljust(8, b"\x00")
+            if c == INTEGER:
+                int_regs[next(int_iter)] = int.from_bytes(chunk, "little")
+            else:
+                float_regs[next(float_iter)] = struct.unpack("<d", chunk)[0]
+        return dataclasses_replace(image, int_regs=tuple(int_regs),
+                                   float_regs=tuple(float_regs))
+
+    raise InvalidTypeError(f"unknown result placement kind {rp.kind!r}")
+
+
+def unpack_result(return_type, image: CallImage):
+    """调用方侧：按同一套布局/对齐规则从返回点映像重建返回值。
+
+    registers 从结果 8 字节块拼回（裁掉最后一块的寄存器零填充，记录
+    内部的对齐填充字节重建为零），memory 从 ``result_buffer`` 整体解码。
+    返回类型是数组时得到 ``list``，记录得到 ``dict``。
+    """
+    if not isinstance(image, CallImage):
+        raise InvalidValueError(f"expected a CallImage, got {image!r}")
+    rp = image.result_placement
+    if rp is None:
+        raise InvalidValueError(
+            "image has no result placement; use pack_callsite()")
+    _check_type(return_type)
+    lay = layout(return_type)
+
+    if rp.kind == "none":
+        if lay.size != 0:
+            raise InvalidTypeError(
+                f"non-empty return type {return_type.name!r} cannot be read "
+                "from a 'none' placement")
+        return decode(return_type, b"", lay, "result")
+
+    if rp.kind == "memory":
+        if rp.eightbytes != classify(return_type):
+            raise InvalidTypeError(
+                f"return type {return_type.name!r} does not match the "
+                "memory result placement")
+        if len(image.result_buffer) != rp.size:
+            raise InvalidValueError(
+                f"result buffer length {len(image.result_buffer)} != "
+                f"expected {rp.size}")
+        return decode(return_type, image.result_buffer, lay, "result")
+
+    if rp.kind == "registers":
+        if rp.eightbytes != classify(return_type):
+            raise InvalidTypeError(
+                f"return type {return_type.name!r} does not match the "
+                f"register result placement {rp.eightbytes}")
+        chunks: list[bytes] = []
+        int_iter = iter(rp.int_regs)
+        float_iter = iter(rp.float_regs)
+        for c in rp.eightbytes:
+            if c == INTEGER:
+                idx = next(int_iter)
+                v = image.int_regs[idx]
+                if not isinstance(v, int) or isinstance(v, bool):
+                    raise InvalidValueError(
+                        f"integer result register {idx} not populated: {v!r}",
+                        "result")
+                chunks.append(v.to_bytes(8, "little"))
+            else:
+                idx = next(float_iter)
+                v = image.float_regs[idx]
+                if not isinstance(v, float):
+                    raise InvalidValueError(
+                        f"float result register {idx} not populated: {v!r}",
+                        "result")
+                chunks.append(struct.pack("<d", v))
+        data = b"".join(chunks)[:lay.size]
+        return decode(return_type, data, lay, "result")
+
+    raise InvalidTypeError(f"unknown result placement kind {rp.kind!r}")
